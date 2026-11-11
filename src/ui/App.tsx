@@ -3,12 +3,11 @@ import { useRozeniteDevToolsClient } from '@rozenite/plugin-bridge';
 import { pluginId } from '../shared/constants';
 import { GraphQLDevToolEventMap } from '../shared/events';
 import { LoadingView } from './components/LoadingView';
-import { Toolbar } from './components/Toolbar';
 import { Tabs, TabsList, TabsTrigger, TabsContent } from './components/Tabs';
 import { OperationsTab } from './tabs/OperationsTab';
 import { CacheTab } from './tabs/CacheTab';
 import { ExplorerTab } from './tabs/ExplorerTab';
-import { useActions, useClientManagement, useIsRecording } from './store/hooks';
+import { useActions, useClientManagement } from './store/hooks';
 import './globals.css';
 
 export default function GraphQLDevToolsPanel() {
@@ -17,8 +16,7 @@ export default function GraphQLDevToolsPanel() {
   });
 
   const { setupClient, cleanupClient } = useClientManagement();
-  const { setRecording, clearOperations } = useActions();
-  const isRecording = useIsRecording();
+  const { setRecording } = useActions();
 
   useEffect(() => {
     if (!client) {
@@ -38,38 +36,25 @@ export default function GraphQLDevToolsPanel() {
     return <LoadingView />;
   }
 
-  const handleToggleRecording = () => {
-    setRecording(!isRecording);
-  };
-
   return (
-    <div className="dark h-screen bg-gray-900 text-gray-100 flex flex-col">
-      <Toolbar
-        isRecording={isRecording}
-        onToggleRecording={handleToggleRecording}
-      />
+    <Tabs defaultValue="operations" className="flex h-screen flex-col bg-background text-foreground">
+      <TabsList>
+        <TabsTrigger value="operations">Operations</TabsTrigger>
+        <TabsTrigger value="cache">Cache</TabsTrigger>
+        <TabsTrigger value="explorer">Explorer</TabsTrigger>
+      </TabsList>
 
-      <Tabs defaultValue="operations" className="flex-1 flex flex-col min-h-0">
-        <div className="border-b border-gray-700 bg-gray-800 px-2">
-          <TabsList className="bg-transparent">
-            <TabsTrigger value="operations">Operations</TabsTrigger>
-            <TabsTrigger value="cache">Cache</TabsTrigger>
-            <TabsTrigger value="explorer">Explorer</TabsTrigger>
-          </TabsList>
-        </div>
+      <TabsContent value="operations" className="min-h-0 flex-1">
+        <OperationsTab />
+      </TabsContent>
 
-        <TabsContent value="operations" className="flex-1 min-h-0">
-          <OperationsTab />
-        </TabsContent>
+      <TabsContent value="cache" className="min-h-0 flex-1">
+        <CacheTab />
+      </TabsContent>
 
-        <TabsContent value="cache" className="flex-1 min-h-0">
-          <CacheTab />
-        </TabsContent>
-
-        <TabsContent value="explorer" className="flex-1 min-h-0">
-          <ExplorerTab />
-        </TabsContent>
-      </Tabs>
-    </div>
+      <TabsContent value="explorer" className="min-h-0 flex-1">
+        <ExplorerTab />
+      </TabsContent>
+    </Tabs>
   );
 }

@@ -13,6 +13,27 @@ export interface GraphQLError {
   extensions?: Record<string, any>;
 }
 
+export interface HttpHeader {
+  name: string;
+  value: string;
+}
+
+/** HTTP details of the request that carried the operation (when the link can see them) */
+export interface OperationRequestInfo {
+  url?: string;
+  headers?: HttpHeader[];
+  /** Body size in bytes (JSON payload) */
+  size: number;
+}
+
+export interface OperationResponseInfo {
+  /** HTTP status code. Undefined when the transport has no HTTP response (e.g. websocket) */
+  status?: number;
+  headers?: HttpHeader[];
+  /** Body size in bytes (JSON payload) */
+  size: number;
+}
+
 // Operation tracking
 export interface GraphQLOperation {
   id: string;
@@ -24,7 +45,12 @@ export interface GraphQLOperation {
   status: OperationStatus;
   duration?: number;
   data?: any;
+  /** First error, or the network error. Kept for older panels */
   error?: GraphQLError;
+  /** Every GraphQL error returned in the response */
+  errors?: GraphQLError[];
+  request?: OperationRequestInfo;
+  response?: OperationResponseInfo;
   /**
    * Optional context data (excluded by default to avoid circular references)
    */
@@ -48,6 +74,28 @@ export interface CacheEntry {
   typename?: string;
   data: any;
   timestamp: number;
+}
+
+/** One write into the client cache (query result, mutation, writeQuery/writeFragment...) */
+export interface CacheWrite {
+  id: string;
+  timestamp: number;
+  /** Cache ID written to, e.g. ROOT_QUERY or Book:1 */
+  dataId: string;
+  /** Operation or fragment name of the document that was written */
+  documentName?: string;
+  variables?: Record<string, unknown>;
+  result: unknown;
+}
+
+/** Result of an operation run from the Explorer tab */
+export interface ExecuteResult {
+  requestId: string;
+  data?: unknown;
+  errors?: GraphQLError[];
+  /** Network/client error message */
+  error?: string;
+  duration: number;
 }
 
 // Schema introspection types

@@ -1,25 +1,92 @@
 import {
     GraphQLOperation,
     CacheEntry,
+    CacheWrite,
+    ExecuteResult,
+    GraphQLError,
     GraphQLSchema,
+    HttpHeader,
+    OperationRequestInfo,
+    OperationResponseInfo,
     OperationType,
 } from '../../shared/types';
 import { GraphQLClientAdapter, AdapterConfig } from './types';
-import { gql, ApolloClient as ApolloClientType, ApolloLink, Observable, FetchResult, Operation } from '@apollo/client';
 import {
-    getIntrospectionQuery,
-    buildClientSchema,
-    isObjectType,
-    isInterfaceType,
-    isUnionType,
-    isEnumType,
-    isInputObjectType,
-    isScalarType,
-    print,
-} from 'graphql';
+    gql,
+    ApolloClient as ApolloClientType,
+    ApolloLink,
+    Observable,
+    FetchResult,
+    NextLink,
+    Operation,
+} from '@apollo/client';
+import type { DocumentNode, GraphQLFormattedError, OperationDefinitionNode } from 'graphql';
+import { getIntrospectionQuery, buildClientSchema, getOperationAST, parse, print } from 'graphql';
+import { toDevtoolSchema } from '../../shared/schema';
 
 // Type alias for Apollo Client
 type ApolloClient = ApolloClientType<any>;
+
+/** Context flag for queries the devtool sends itself (introspection). The link skips them */
+const INTERNAL_CONTEXT_KEY = '__rozeniteInternal';
+
+const toHeaders = (source: unknown): HttpHeader[] | undefined => {
+    if (!source || typeof source !== 'object') return undefined;
+    // Fetch `Headers` (has forEach) or a plain object from `setContext({ headers })`
+    if ('forEach' in source && typeof source.forEach === 'function') {
+        const headers: HttpHeader[] = [];
+        (source as Headers).forEach((value, name) => headers.push({ name, value }));
+        return headers;
+    }
+    return Object.entries(source).map(([name, value]) => ({ name, value: String(value) }));
+};
+
+const byteSize = (value: unknown): number => {
+    const json = JSON.stringify(value) ?? '';
+    return typeof TextEncoder === 'undefined' ? json.length : new TextEncoder().encode(json).length;
+};
+
+const toPlainError = ({ message, locations, path, extensions }: GraphQLFormattedError): GraphQLError => ({
+    message,
+    locations: locations && [...locations],
+    path: path && [...path],
+    extensions,
+});
+
+/** Name of the first named definition (operation or fragment) */
+const documentName = (document: DocumentNode): string | undefined => {
+    for (const definition of document.definitions) {
+        if ('name' in definition && definition.name) return definition.name.value;
+    }
+    return undefined;
+};
+
+/**
+ * Read HTTP details. HttpLink stores the fetch Response on the context,
+ * so this works without knowing the endpoint up front.
+ */
+const readHttp = (
+    operation: Operation,
+    body: { operationName: string; query: string; variables?: Record<string, unknown> },
+    result?: FetchResult,
+    failedResponse?: Response,
+): { request: OperationRequestInfo; response: OperationResponseInfo } => {
+    const context = operation.getContext();
+    const response: Response | undefined = context.response ?? failedResponse;
+    const uri = typeof context.uri === 'string' ? context.uri : undefined;
+    return {
+        request: {
+            url: response?.url || uri,
+            headers: toHeaders(context.headers),
+            size: byteSize(body),
+        },
+        response: {
+            status: response?.status,
+            headers: toHeaders(response?.headers),
+            size: result ? byteSize(result) : 0,
+        },
+    };
+};
 
 /**
  * Apollo Client adapter for the GraphQL DevTools plugin.
@@ -49,7 +116,9 @@ export class ApolloClientAdapter implements GraphQLClientAdapter {
     private client: ApolloClient;
     private config: Required<AdapterConfig>;
     private operationCallbacks: Set<(operation: GraphQLOperation) => void> = new Set();
-    private cacheCallbacks: Set<(entry: CacheEntry) => void> = new Set();
+    private cacheCallbacks: Set<(write: CacheWrite) => void> = new Set();
+    private restoreCacheWrite?: () => void;
+    private writeCounter = 0;
     private operationCounter = 0;
 
     // ============================================================================
@@ -70,22 +139,52 @@ export class ApolloClientAdapter implements GraphQLClientAdapter {
     // ============================================================================
 
     initialize(): void {
-        try {
-            // Register this adapter globally so the link can find it
-            (globalThis as any).__ROZENITE_APOLLO_ADAPTER__ = this;
-        } catch (error) {
-            console.error('[Apollo Adapter] Failed to initialize:', error);
-        }
+        // Register this adapter globally so the link can find it
+        (globalThis as any).__ROZENITE_APOLLO_ADAPTER__ = this;
+        this.watchCacheWrites();
     }
 
     cleanup(): void {
         this.operationCallbacks.clear();
         this.cacheCallbacks.clear();
+        this.restoreCacheWrite?.();
 
         // Unregister global adapter
         if ((globalThis as any).__ROZENITE_APOLLO_ADAPTER__ === this) {
             delete (globalThis as any).__ROZENITE_APOLLO_ADAPTER__;
         }
+    }
+
+    /**
+     * Every cache write (query results, mutations, writeQuery/writeFragment) goes through
+     * cache.write, so wrapping it gives a full write log. Restored on cleanup.
+     */
+    private watchCacheWrites(): void {
+        const cache = this.client.cache;
+        const callbacks = this.cacheCallbacks;
+        const nextId = () => this.writeCounter++;
+        const unwrapped = cache.write;
+        const original = cache.write.bind(cache);
+        const wrapped: typeof cache.write = (options) => {
+            const ref = original(options);
+            if (callbacks.size > 0) {
+                const write: CacheWrite = {
+                    id: `write-${nextId()}`,
+                    timestamp: Date.now(),
+                    dataId: options.dataId ?? 'ROOT_QUERY',
+                    documentName: documentName(options.query),
+                    // TVariables is the caller's own shape; it is always a plain object
+                    variables: options.variables as Record<string, unknown> | undefined,
+                    result: options.result,
+                };
+                callbacks.forEach((callback) => callback(write));
+            }
+            return ref;
+        };
+        cache.write = wrapped;
+        this.restoreCacheWrite = () => {
+            cache.write = unwrapped;
+        };
     }
 
     // ============================================================================
@@ -95,40 +194,37 @@ export class ApolloClientAdapter implements GraphQLClientAdapter {
     /**
      * Internal method to track an operation through the link
      */
-    trackOperation(operation: Operation, forward: any): Observable<FetchResult> {
+    trackOperation(operation: Operation, forward: NextLink): Observable<FetchResult> {
+        // Our own introspection query: run it, don't list it
+        if (operation.getContext()[INTERNAL_CONTEXT_KEY]) {
+            return forward(operation);
+        }
+
         const startTime = Date.now();
         const baseOperationId = `${operation.operationName || 'anonymous'}-${this.operationCounter++}-${startTime}`;
 
-        // Extract operation details
         const operationDef = operation.query.definitions.find(
-            (def: any) => def.kind === 'OperationDefinition'
-        ) as any;
-        const operationType = operationDef?.operation || 'query';
-
+            (def): def is OperationDefinitionNode => def.kind === 'OperationDefinition'
+        );
+        const operationType: OperationType = operationDef?.operation ?? 'query';
         const isSubscription = operationType === 'subscription';
 
-        // For subscriptions, emit an "active" state when first registered (listening for events)
-        // For queries/mutations, emit loading state
-        const initialOperation: GraphQLOperation = {
-            id: baseOperationId,
+        const base = {
             operationName: operation.operationName || 'Unnamed Operation',
-            operationType: operationType as 'query' | 'mutation' | 'subscription',
+            operationType,
             query: print(operation.query),
             variables: this.config.includeVariables ? operation.variables : undefined,
-            timestamp: startTime,
-            status: isSubscription ? 'active' : 'loading',
-            duration: undefined,
-            ...(isSubscription && {
-                metadata: {
-                    isActive: true,
-                    eventCount: 0,
-                }
-            }),
         };
 
-        this.notifyOperationCallbacks(initialOperation);
+        // Subscriptions start "active" (listening), queries/mutations start "loading"
+        this.notifyOperationCallbacks({
+            ...base,
+            id: baseOperationId,
+            timestamp: startTime,
+            status: isSubscription ? 'active' : 'loading',
+            ...(isSubscription && { metadata: { isActive: true, eventCount: 0 } }),
+        });
 
-        // Forward the operation and capture response
         let eventCount = 0;
 
         return new Observable((observer) => {
@@ -136,92 +232,65 @@ export class ApolloClientAdapter implements GraphQLClientAdapter {
                 next: (result: FetchResult) => {
                     eventCount++;
                     const eventTime = Date.now();
-                    const duration = eventTime - startTime;
-                    const status = result.errors ? 'error' : 'success';
+                    const errors = result.errors?.map(toPlainError);
 
-                    // For subscriptions: Create a NEW operation entry for EACH event
-                    // For queries/mutations: Update the existing operation
-                    const operationId = isSubscription
-                        ? `${baseOperationId}-event-${eventCount}`
-                        : baseOperationId;
-
-                    const operationUpdate: GraphQLOperation = {
-                        id: operationId,
-                        operationName: operation.operationName || 'Unnamed Operation',
-                        operationType: operationType as 'query' | 'mutation' | 'subscription',
-                        query: print(operation.query),
-                        variables: this.config.includeVariables ? operation.variables : undefined,
-                        timestamp: isSubscription ? eventTime : startTime, // Use event time for subscription events
-                        status,
-                        duration: isSubscription ? eventTime - startTime : duration,
+                    // Subscriptions: one entry per event. Queries/mutations: update the entry
+                    this.notifyOperationCallbacks({
+                        ...base,
+                        ...readHttp(operation, base, result),
+                        id: isSubscription ? `${baseOperationId}-event-${eventCount}` : baseOperationId,
+                        timestamp: isSubscription ? eventTime : startTime,
+                        status: errors ? 'error' : 'success',
+                        duration: eventTime - startTime,
                         data: this.config.includeResponseData ? result.data : undefined,
-                        error: result.errors ? {
-                            message: result.errors.map(e => e.message).join(', '),
-                            extensions: result.errors[0]?.extensions,
-                        } : undefined,
-                        // Add metadata for subscriptions to link events to parent
+                        errors,
+                        error: errors && {
+                            ...errors[0],
+                            message: errors.map((e) => e.message).join(', '),
+                        },
                         ...(isSubscription && {
-                            metadata: {
-                                parentId: baseOperationId,
-                                eventNumber: eventCount,
-                                isActive: true,
-                            }
+                            metadata: { parentId: baseOperationId, eventNumber: eventCount, isActive: true },
                         }),
-                    };
+                    });
 
-                    this.notifyOperationCallbacks(operationUpdate);
                     observer.next(result);
                 },
-                error: (error: Error) => {
-                    const duration = Date.now() - startTime;
+                error: (error: unknown) => {
+                    const message = error instanceof Error ? error.message : String(error);
+                    // ServerError/ServerParseError carry the HTTP response
+                    const failedResponse =
+                        typeof error === 'object' && error !== null && 'response' in error
+                            ? (error as { response?: Response }).response
+                            : undefined;
 
-                    // Emit error operation
-                    const errorOperation: GraphQLOperation = {
+                    this.notifyOperationCallbacks({
+                        ...base,
+                        ...readHttp(operation, base, undefined, failedResponse),
                         id: baseOperationId,
-                        operationName: operation.operationName || 'Unnamed Operation',
-                        operationType: operationType as 'query' | 'mutation' | 'subscription',
-                        query: print(operation.query),
-                        variables: this.config.includeVariables ? operation.variables : undefined,
                         timestamp: startTime,
                         status: 'error',
-                        duration,
-                        error: {
-                            message: error.message || 'Network error',
-                        },
-                    };
-
-                    this.notifyOperationCallbacks(errorOperation);
+                        duration: Date.now() - startTime,
+                        error: { message: message || 'Network error' },
+                    });
                     observer.error(error);
                 },
                 complete: () => {
                     // For subscriptions, emit a final update when they complete/unsubscribe
                     if (isSubscription && eventCount > 0) {
-                        const duration = Date.now() - startTime;
-                        const completedOperation: GraphQLOperation = {
+                        this.notifyOperationCallbacks({
+                            ...base,
                             id: `${baseOperationId}-completed`,
-                            operationName: operation.operationName || 'Unnamed Operation',
-                            operationType: 'subscription',
-                            query: print(operation.query),
-                            variables: this.config.includeVariables ? operation.variables : undefined,
                             timestamp: Date.now(),
                             status: 'success',
-                            duration,
-                            metadata: {
-                                parentId: baseOperationId,
-                                eventCount,
-                                isActive: false,
-                                completed: true
-                            }
-                        };
-                        this.notifyOperationCallbacks(completedOperation);
+                            duration: Date.now() - startTime,
+                            metadata: { parentId: baseOperationId, eventCount, isActive: false, completed: true },
+                        });
                     }
                     observer.complete();
                 },
             });
 
-            return () => {
-                subscription.unsubscribe();
-            };
+            return () => subscription.unsubscribe();
         });
     }
 
@@ -254,137 +323,37 @@ export class ApolloClientAdapter implements GraphQLClientAdapter {
 
     async getSchema(): Promise<GraphQLSchema> {
         try {
-            // Execute introspection query
             const result = await this.client.query({
                 query: gql(getIntrospectionQuery()),
                 fetchPolicy: 'network-only',
+                context: { [INTERNAL_CONTEXT_KEY]: true },
             });
-
-            if (!result.data) {
-                console.warn('[Apollo Adapter] No schema data returned');
-                return { types: [] };
-            }
-
-            // Build client schema from introspection result
-            const schema = buildClientSchema(result.data);
-
-            // Extract query, mutation, and subscription types
-            const queryType = schema.getQueryType();
-            const mutationType = schema.getMutationType();
-            const subscriptionType = schema.getSubscriptionType();
-
-            // Helper to convert fields
-            const convertFields = (fields: any) => {
-                if (!fields) return undefined;
-
-                return Object.values(fields).map((field: any) => ({
-                    name: field.name,
-                    type: field.type.toString(),
-                    description: field.description,
-                    args: field.args?.map((arg: any) => ({
-                        name: arg.name,
-                        type: arg.type.toString(),
-                        description: arg.description,
-                        defaultValue: arg.defaultValue,
-                    })),
-                    isDeprecated: field.isDeprecated,
-                    deprecationReason: field.deprecationReason,
-                }));
-            };
-
-            // Extract all types from schema
-            const typeMap = schema.getTypeMap();
-            const allTypes = Object.values(typeMap)
-                .filter((type: any) => {
-                    // Filter out built-in types (starting with __)
-                    return !type.name.startsWith('__');
-                })
-                .map((type: any) => {
-                    // Determine type kind using GraphQL type guards
-                    let kind: 'OBJECT' | 'INTERFACE' | 'UNION' | 'ENUM' | 'INPUT_OBJECT' | 'SCALAR' = 'OBJECT';
-                    if (isScalarType(type)) {
-                        kind = 'SCALAR';
-                    } else if (isEnumType(type)) {
-                        kind = 'ENUM';
-                    } else if (isInputObjectType(type)) {
-                        kind = 'INPUT_OBJECT';
-                    } else if (isInterfaceType(type)) {
-                        kind = 'INTERFACE';
-                    } else if (isUnionType(type)) {
-                        kind = 'UNION';
-                    } else if (isObjectType(type)) {
-                        kind = 'OBJECT';
-                    }
-
-                    const typeObj: any = {
-                        name: type.name,
-                        kind,
-                        description: type.description,
-                    };
-
-                    // Add fields for object and interface types
-                    if ((isObjectType(type) || isInterfaceType(type) || isInputObjectType(type)) && type.getFields) {
-                        try {
-                            typeObj.fields = convertFields(type.getFields());
-                        } catch (e) {
-                            // Some types might not have fields
-                        }
-                    }
-
-                    // Add enum values
-                    if (isEnumType(type) && type.getValues) {
-                        try {
-                            typeObj.enumValues = type.getValues().map((v: any) => v.name);
-                        } catch (e) {
-                            // Error getting enum values
-                        }
-                    }
-
-                    // Add interfaces (for object types)
-                    if (isObjectType(type) && type.getInterfaces) {
-                        try {
-                            typeObj.interfaces = type.getInterfaces().map((i: any) => i.name);
-                        } catch (e) {
-                            // No interfaces
-                        }
-                    }
-
-                    // Add possible types for unions/interfaces
-                    if ((isUnionType(type) || isInterfaceType(type)) && schema.getPossibleTypes) {
-                        try {
-                            typeObj.possibleTypes = schema.getPossibleTypes(type).map((t: any) => t.name);
-                        } catch (e) {
-                            // No possible types
-                        }
-                    }
-
-                    return typeObj;
-                });
-
-            return {
-                queryType: queryType ? {
-                    name: queryType.name,
-                    kind: 'OBJECT' as const,
-                    fields: convertFields(queryType.getFields()),
-                    description: queryType.description,
-                } : undefined,
-                mutationType: mutationType ? {
-                    name: mutationType.name,
-                    kind: 'OBJECT' as const,
-                    fields: convertFields(mutationType.getFields()),
-                    description: mutationType.description,
-                } : undefined,
-                subscriptionType: subscriptionType ? {
-                    name: subscriptionType.name,
-                    kind: 'OBJECT' as const,
-                    fields: convertFields(subscriptionType.getFields()),
-                    description: subscriptionType.description,
-                } : undefined,
-                types: allTypes,
-            };
+            return result.data ? toDevtoolSchema(buildClientSchema(result.data)) : { types: [] };
         } catch (error) {
             console.error('[Apollo Adapter] Failed to fetch schema:', error);
             return { types: [] };
+        }
+    }
+
+    async execute({ query, variables, headers }: {
+        query: string;
+        variables?: Record<string, unknown>;
+        headers?: Record<string, string>;
+    }): Promise<Omit<ExecuteResult, 'requestId' | 'duration'>> {
+        try {
+            const document = parse(query);
+            const type = getOperationAST(document)?.operation;
+            if (type === 'subscription') {
+                return { error: 'Subscriptions can not be run from the Explorer yet.' };
+            }
+            // Runs through the normal link chain (auth etc.), so it also shows in Operations
+            const options = { variables, context: { headers }, errorPolicy: 'all' } as const;
+            const result = type === 'mutation'
+                ? await this.client.mutate({ mutation: document, ...options })
+                : await this.client.query({ query: document, fetchPolicy: 'network-only', ...options });
+            return { data: result.data, errors: result.errors?.map(toPlainError) };
+        } catch (error) {
+            return { error: error instanceof Error ? error.message : String(error) };
         }
     }
 
@@ -395,7 +364,7 @@ export class ApolloClientAdapter implements GraphQLClientAdapter {
         };
     }
 
-    onCacheChange(callback: (entry: CacheEntry) => void): () => void {
+    onCacheWrite(callback: (write: CacheWrite) => void): () => void {
         this.cacheCallbacks.add(callback);
         return () => {
             this.cacheCallbacks.delete(callback);

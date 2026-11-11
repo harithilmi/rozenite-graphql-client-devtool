@@ -136,21 +136,23 @@ useGraphqlClientDevtool({
 
 ### 1. Operations Tab
 
-Monitor all GraphQL operations in real-time with comprehensive details.
+A Network-panel style list of every GraphQL operation, modelled on the
+[GraphQL Network Inspector](https://github.com/warrenday/graphql-network-inspector) extension.
 
 **Features:**
-- Real-time operation tracking with status indicators (pending, loading, success, error)
-- Filter operations by type (Query, Mutation, Subscription)
-- Search operations by name
-- Sort by timestamp (newest first)
-- Detailed operation view including:
-  - GraphQL query/mutation text with syntax highlighting
-  - Variables used in the operation
-  - Response data in an interactive JSON tree view
-  - Error details with location and path information
-  - Timing information (duration)
-- Color-coded operation types and status badges
-- Clear all operations button
+- Table with type badge (Q / M / S), HTTP status, response size, duration and URL, oldest first (follows new rows like DevTools)
+- Red rows for failed requests (network error, HTTP 4xx/5xx), amber badge + `200 · 1 err` for responses that carry GraphQL `errors`
+- Live elapsed time for pending operations
+- Filter by name with **Invert** and **Regex**; matches are highlighted
+- Toggle Queries / Mutations / Subscriptions from the footer, which also shows totals (count, failures, bytes received)
+- **Search** (⌘/Ctrl+F) across queries, variables, responses and headers; opening a hit marks it in the details pane
+- Details pane (resizable) with **Headers** (URL, status, timing, sizes, request and response headers), **Request** (query + variables), **Response** (JSON tree with error cards) and **Response (Raw)**
+- Copy query, variables, response, headers, or the whole request **as cURL**
+- ↑ / ↓ to move between operations, Esc to close the details
+- Follows the DevTools light / dark theme
+
+URL, status and headers come from the fetch `Response` that Apollo's `HttpLink` puts on the operation context, so no extra setup is needed.
+The Explorer tab's introspection query is sent only when you open that tab, and it is not listed in Operations.
 
 ### 2. Cache Tab
 
@@ -302,6 +304,16 @@ import type {
 ## 🤝 Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
+
+### Preview the panel in a browser
+
+```bash
+npm run preview   # http://localhost:3200
+```
+
+This runs the DevTools panel with a mock bridge (`preview/mock-bridge.ts`) that replays demo operations
+from `preview/fixtures.ts`. Press `r` to send them again. To preview with your own app's operations, add a
+git-ignored `preview/fixtures.local.ts` that exports `fixtures` (see `preview/op.ts` for the helper).
 
 ---
 

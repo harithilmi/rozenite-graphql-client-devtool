@@ -1,364 +1,172 @@
 import { createStore } from 'zustand';
-import {
-  GraphQLDevToolsClient,
-  GraphQLDevToolEventMap,
-} from '../../shared/events';
-import {
-  GraphQLOperation,
+import type { GraphQLDevToolsClient, GraphQLDevToolEventMap } from '../../shared/events';
+import type {
   CacheEntry,
+  CacheWrite,
+  ExecuteResult,
+  GraphQLOperation,
   GraphQLSchema,
-  OperationType,
 } from '../../shared/types';
 
+const MAX_OPERATIONS = 1000;
+const MAX_CACHE_WRITES = 500;
+
+export interface ExplorerDraft {
+  query: string;
+  variables: string;
+  headers: string;
+}
+
 export interface GraphQLDevToolsState {
-  // State
   isRecording: boolean;
   selectedOperationId: string | null;
   operations: Map<string, GraphQLOperation>;
   cacheEntries: Map<string, CacheEntry>;
+  cacheWrites: CacheWrite[];
+  isRecordingCacheWrites: boolean;
   schema: GraphQLSchema | null;
-  selectedTab: 'operations' | 'cache' | 'explorer';
-  autoSync: {
-    enabled: boolean;
-    durationMinutes: number | null;
-    endTime: number | null;
-    intervalId: ReturnType<typeof setInterval> | null;
-  };
+  /** Explorer editor content, kept here so it survives tab switches */
+  explorer: ExplorerDraft;
+  execution: { requestId: string; startedAt: number; result?: ExecuteResult } | null;
 
-  // Internal state
-  _unsubscribeFunctions?: Array<{ remove: () => void }>;
   _client?: GraphQLDevToolsClient;
+  _subscriptions: Array<{ remove: () => void }>;
 
-  // Actions
   actions: {
     setRecording: (isRecording: boolean) => void;
     setSelectedOperation: (operationId: string | null) => void;
     clearOperations: () => void;
-    setSelectedTab: (tab: 'operations' | 'cache' | 'explorer') => void;
     requestCacheSnapshot: () => void;
     requestSchema: () => void;
-    startAutoSync: (durationMinutes: number) => void;
-    stopAutoSync: () => void;
+    setRecordingCacheWrites: (isRecording: boolean) => void;
+    clearCacheWrites: () => void;
+    setExplorerDraft: (patch: Partial<ExplorerDraft>) => void;
+    execute: (request: { query: string; variables?: Record<string, unknown>; headers?: Record<string, string> }) => void;
   };
 
-  // Event handling
-  handleEvent: <K extends keyof GraphQLDevToolEventMap>(
-    eventType: K,
-    data: GraphQLDevToolEventMap[K]
-  ) => void;
-
-  // Client management
   client: {
     setupClient: (client: GraphQLDevToolsClient) => void;
     cleanupClient: () => void;
   };
 }
 
+type Incoming = Pick<
+  GraphQLDevToolEventMap,
+  | 'operation-start'
+  | 'operation-update'
+  | 'operation-complete'
+  | 'operation-error'
+  | 'cache-snapshot'
+  | 'cache-write'
+  | 'schema-loaded'
+  | 'execute-result'
+>;
+
 export const createGraphQLDevToolsStore = () =>
-  createStore<GraphQLDevToolsState>()((set, get) => ({
-    // Initial state
-    isRecording: true,
-    selectedOperationId: null,
-    operations: new Map(),
-    cacheEntries: new Map(),
-    schema: null,
-    selectedTab: 'operations',
-    autoSync: {
-      enabled: false,
-      durationMinutes: null,
-      endTime: null,
-      intervalId: null,
-    },
+  createStore<GraphQLDevToolsState>()((set, get) => {
+    const send = <K extends keyof GraphQLDevToolEventMap>(type: K, payload: GraphQLDevToolEventMap[K]) =>
+      get()._client?.send(type, payload);
 
-    // Actions
-    actions: {
-      setRecording: (isRecording: boolean) => {
-        const { _client } = get();
-        if (!_client) return;
+    /** Apply a change to one operation, if we still have it */
+    const patchOperation = (id: string, patch: Partial<GraphQLOperation>) =>
+      set((state) => {
+        const operation = state.operations.get(id);
+        if (!operation) return state;
+        const operations = new Map(state.operations);
+        operations.set(id, { ...operation, ...patch });
+        return { operations };
+      });
 
-        _client.send(isRecording ? 'graphql-enable' : 'graphql-disable', {});
-        set({ isRecording });
-      },
+    // Cache writes come in bursts (one per query result); refresh the snapshot once per burst
+    let snapshotTimer: ReturnType<typeof setTimeout> | undefined;
+    const refreshCacheSoon = () => {
+      clearTimeout(snapshotTimer);
+      snapshotTimer = setTimeout(() => send('get-cache-snapshot', {}), 250);
+    };
 
-      setSelectedOperation: (operationId: string | null) =>
-        set({ selectedOperationId: operationId }),
-
-      clearOperations: () => {
-        const { _client } = get();
-        if (_client) {
-          _client.send('clear-operations', {});
-        }
-        set({
-          operations: new Map(),
-          selectedOperationId: null,
-        });
-      },
-
-      setSelectedTab: (tab: 'operations' | 'cache' | 'explorer') =>
-        set({ selectedTab: tab }),
-
-      requestCacheSnapshot: () => {
-        const { _client } = get();
-        if (_client) {
-          _client.send('get-cache-snapshot', {});
-        }
-      },
-
-      requestSchema: () => {
-        const { _client } = get();
-        if (_client) {
-          _client.send('get-schema', {});
-        }
-      },
-
-      startAutoSync: (durationMinutes: number) => {
-        const { autoSync, actions } = get();
-
-        // Stop existing sync if any
-        if (autoSync.intervalId) {
-          clearInterval(autoSync.intervalId);
-        }
-
-        const endTime = Date.now() + durationMinutes * 60 * 1000;
-
-        // Poll every 2.5 seconds
-        const intervalId = setInterval(() => {
-          const now = Date.now();
-          const currentState = get();
-
-          if (now >= currentState.autoSync.endTime!) {
-            actions.stopAutoSync();
-          } else {
-            actions.requestCacheSnapshot();
+    const handlers: { [K in keyof Incoming]: (payload: Incoming[K]) => void } = {
+      'operation-start': ({ operation }) =>
+        set((state) => {
+          const operations = new Map(state.operations);
+          // Drop the oldest entry once the limit is hit (Map keeps insertion order)
+          if (operations.size >= MAX_OPERATIONS) {
+            const oldest = operations.keys().next().value;
+            if (oldest) operations.delete(oldest);
           }
-        }, 2500);
+          operations.set(operation.id, operation);
+          return { operations };
+        }),
+      'operation-update': ({ id, updates }) => patchOperation(id, updates),
+      'operation-complete': ({ id, ...result }) => patchOperation(id, { ...result, status: 'success' }),
+      'operation-error': ({ id, ...result }) => patchOperation(id, { ...result, status: 'error' }),
+      'cache-snapshot': ({ entries }) =>
+        set({ cacheEntries: new Map(entries.map((entry) => [entry.id, entry])) }),
+      'cache-write': ({ write }) => {
+        refreshCacheSoon();
+        if (!get().isRecordingCacheWrites) return;
+        set((state) => ({ cacheWrites: [write, ...state.cacheWrites].slice(0, MAX_CACHE_WRITES) }));
+      },
+      'schema-loaded': ({ schema }) => set({ schema }),
+      'execute-result': (result) =>
+        set((state) =>
+          state.execution?.requestId === result.requestId
+            ? { execution: { ...state.execution, result } }
+            : state,
+        ),
+    };
 
-        set({
-          autoSync: {
-            enabled: true,
-            durationMinutes,
-            endTime,
-            intervalId,
-          },
-        });
+    return {
+      isRecording: true,
+      selectedOperationId: null,
+      operations: new Map(),
+      cacheEntries: new Map(),
+      cacheWrites: [],
+      isRecordingCacheWrites: true,
+      schema: null,
+      explorer: { query: '', variables: '{}', headers: '{}' },
+      execution: null,
+      _subscriptions: [],
 
-        // Immediate fetch
-        actions.requestCacheSnapshot();
+      actions: {
+        setRecording: (isRecording) => {
+          send(isRecording ? 'graphql-enable' : 'graphql-disable', {});
+          set({ isRecording });
+        },
+        setSelectedOperation: (selectedOperationId) => set({ selectedOperationId }),
+        clearOperations: () => {
+          send('clear-operations', {});
+          set({ operations: new Map(), selectedOperationId: null });
+        },
+        requestCacheSnapshot: () => send('get-cache-snapshot', {}),
+        requestSchema: () => send('get-schema', {}),
+        setRecordingCacheWrites: (isRecordingCacheWrites) => set({ isRecordingCacheWrites }),
+        clearCacheWrites: () => set({ cacheWrites: [] }),
+        setExplorerDraft: (patch) => set((state) => ({ explorer: { ...state.explorer, ...patch } })),
+        execute: (request) => {
+          const requestId = `run-${Date.now()}`;
+          set({ execution: { requestId, startedAt: Date.now() } });
+          send('execute-operation', { requestId, ...request });
+        },
       },
 
-      stopAutoSync: () => {
-        const { autoSync } = get();
-
-        if (autoSync.intervalId) {
-          clearInterval(autoSync.intervalId);
-        }
-
-        set({
-          autoSync: {
-            enabled: false,
-            durationMinutes: null,
-            endTime: null,
-            intervalId: null,
-          },
-        });
+      client: {
+        setupClient: (client) => {
+          // Each key's handler matches its payload; TS can't follow that through the loop
+          const subscriptions = (Object.keys(handlers) as Array<keyof Incoming>).map((type) =>
+            client.onMessage(type, handlers[type] as (payload: Incoming[typeof type]) => void),
+          );
+          set({ _subscriptions: subscriptions, _client: client });
+          // Schema is requested when the Explorer tab opens (it fires an introspection query)
+          client.send('get-cache-snapshot', {});
+        },
+        cleanupClient: () => {
+          clearTimeout(snapshotTimer);
+          get()._subscriptions.forEach((subscription) => subscription.remove());
+          get()._client?.send('graphql-disable', {});
+          set({ _subscriptions: [], _client: undefined });
+        },
       },
-    },
-
-    // Event handling
-    handleEvent: <K extends keyof GraphQLDevToolEventMap>(
-      eventType: K,
-      data: GraphQLDevToolEventMap[K]
-    ) => {
-      switch (eventType) {
-        case 'operation-start': {
-          const eventData = data as GraphQLDevToolEventMap['operation-start'];
-          set((state) => {
-            const newOperations = new Map(state.operations);
-
-            // Enforce operation limit (default 1000)
-            const maxOperations = 1000;
-            if (newOperations.size >= maxOperations) {
-              // Remove oldest operation (first entry in the Map)
-              const firstKey = newOperations.keys().next().value;
-              if (firstKey) {
-                newOperations.delete(firstKey);
-              }
-            }
-
-            newOperations.set(eventData.operation.id, eventData.operation);
-            return { operations: newOperations };
-          });
-          break;
-        }
-
-        case 'operation-update': {
-          const eventData = data as GraphQLDevToolEventMap['operation-update'];
-          set((state) => {
-            const operation = state.operations.get(eventData.id);
-            if (!operation) return state;
-
-            const updatedOperation = {
-              ...operation,
-              ...eventData.updates,
-            };
-
-            const newOperations = new Map(state.operations);
-            newOperations.set(eventData.id, updatedOperation);
-            return { operations: newOperations };
-          });
-          break;
-        }
-
-        case 'operation-complete': {
-          const eventData =
-            data as GraphQLDevToolEventMap['operation-complete'];
-          set((state) => {
-            const operation = state.operations.get(eventData.id);
-            if (!operation) return state;
-
-            const updatedOperation: GraphQLOperation = {
-              ...operation,
-              status: 'success',
-              data: eventData.data,
-              duration: eventData.duration,
-            };
-
-            const newOperations = new Map(state.operations);
-            newOperations.set(eventData.id, updatedOperation);
-            return { operations: newOperations };
-          });
-          break;
-        }
-
-        case 'operation-error': {
-          const eventData = data as GraphQLDevToolEventMap['operation-error'];
-          set((state) => {
-            const operation = state.operations.get(eventData.id);
-            if (!operation) return state;
-
-            const updatedOperation: GraphQLOperation = {
-              ...operation,
-              status: 'error',
-              error: eventData.error,
-              duration: eventData.duration,
-            };
-
-            const newOperations = new Map(state.operations);
-            newOperations.set(eventData.id, updatedOperation);
-            return { operations: newOperations };
-          });
-          break;
-        }
-
-        case 'cache-snapshot': {
-          const eventData = data as GraphQLDevToolEventMap['cache-snapshot'];
-          set(() => {
-            const newCacheEntries = new Map<string, CacheEntry>();
-            eventData.entries.forEach((entry) => {
-              newCacheEntries.set(entry.id, entry);
-            });
-            return { cacheEntries: newCacheEntries };
-          });
-          break;
-        }
-
-        case 'cache-update': {
-          const eventData = data as GraphQLDevToolEventMap['cache-update'];
-          set((state) => {
-            const newCacheEntries = new Map(state.cacheEntries);
-            newCacheEntries.set(eventData.entry.id, eventData.entry);
-            return { cacheEntries: newCacheEntries };
-          });
-          break;
-        }
-
-        case 'cache-invalidate': {
-          const eventData = data as GraphQLDevToolEventMap['cache-invalidate'];
-          set((state) => {
-            const newCacheEntries = new Map(state.cacheEntries);
-            eventData.keys.forEach((key) => {
-              newCacheEntries.delete(key);
-            });
-            return { cacheEntries: newCacheEntries };
-          });
-          break;
-        }
-
-        case 'schema-loaded': {
-          const eventData = data as GraphQLDevToolEventMap['schema-loaded'];
-          set({ schema: eventData.schema });
-          break;
-        }
-      }
-    },
-
-    // Client management
-    client: {
-      setupClient: (client: GraphQLDevToolsClient) => {
-        const { handleEvent } = get();
-
-        // Subscribe to all events using the unified handler
-        const unsubscribeFunctions = [
-          client.onMessage('operation-start', (data) =>
-            handleEvent('operation-start', data)
-          ),
-          client.onMessage('operation-update', (data) =>
-            handleEvent('operation-update', data)
-          ),
-          client.onMessage('operation-complete', (data) =>
-            handleEvent('operation-complete', data)
-          ),
-          client.onMessage('operation-error', (data) =>
-            handleEvent('operation-error', data)
-          ),
-          client.onMessage('cache-snapshot', (data) =>
-            handleEvent('cache-snapshot', data)
-          ),
-          client.onMessage('cache-update', (data) =>
-            handleEvent('cache-update', data)
-          ),
-          client.onMessage('cache-invalidate', (data) =>
-            handleEvent('cache-invalidate', data)
-          ),
-          client.onMessage('schema-loaded', (data) =>
-            handleEvent('schema-loaded', data)
-          ),
-        ];
-
-        // Store unsubscribe functions in the state for cleanup
-        set({
-          _unsubscribeFunctions: unsubscribeFunctions,
-          _client: client,
-        });
-
-        // Request initial data
-        client.send('get-schema', {});
-        client.send('get-cache-snapshot', {});
-      },
-
-      cleanupClient: () => {
-        const { _unsubscribeFunctions, _client, autoSync, actions } = get();
-
-        // Stop auto-sync if active
-        if (autoSync.intervalId) {
-          actions.stopAutoSync();
-        }
-
-        if (_unsubscribeFunctions) {
-          _unsubscribeFunctions.forEach((unsubscribe) => unsubscribe.remove());
-        }
-
-        if (_client) {
-          _client.send('graphql-disable', {});
-        }
-
-        set({
-          _unsubscribeFunctions: undefined,
-          _client: undefined,
-        });
-      },
-    },
-  }));
+    };
+  });
 
 export const store = createGraphQLDevToolsStore();
-

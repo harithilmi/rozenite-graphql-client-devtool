@@ -1,43 +1,16 @@
 import { useStore } from 'zustand';
-import { store, GraphQLDevToolsState } from './store';
+import { store, type GraphQLDevToolsState } from './store';
 
-// Selectors
-export const useIsRecording = () =>
-  useStore(store, (state) => state.isRecording);
+const select = <T,>(selector: (state: GraphQLDevToolsState) => T) => () => useStore(store, selector);
 
-export const useSelectedOperationId = () =>
-  useStore(store, (state) => state.selectedOperationId);
-
-export const useOperations = () =>
-  useStore(store, (state) => state.operations);
-
-export const useCacheEntries = () =>
-  useStore(store, (state) => state.cacheEntries);
-
-export const useSchema = () =>
-  useStore(store, (state) => state.schema);
-
-export const useSelectedTab = () =>
-  useStore(store, (state) => state.selectedTab);
-
-export const useSelectedOperation = () => {
-  const selectedId = useSelectedOperationId();
-  const operations = useOperations();
-  return selectedId ? operations.get(selectedId) : null;
-};
-
-export const useHasSelectedOperation = () => {
-  const selectedId = useSelectedOperationId();
-  return selectedId !== null;
-};
-
-export const useAutoSync = () =>
-  useStore(store, (state) => state.autoSync);
-
-// Actions
-export const useActions = () =>
-  useStore(store, (state) => state.actions);
-
-export const useClientManagement = () =>
-  useStore(store, (state) => state.client);
-
+export const useIsRecording = select((state) => state.isRecording);
+export const useSelectedOperationId = select((state) => state.selectedOperationId);
+export const useOperations = select((state) => state.operations);
+export const useCacheEntries = select((state) => state.cacheEntries);
+export const useCacheWrites = select((state) => state.cacheWrites);
+export const useIsRecordingCacheWrites = select((state) => state.isRecordingCacheWrites);
+export const useSchema = select((state) => state.schema);
+export const useExplorerDraft = select((state) => state.explorer);
+export const useExecution = select((state) => state.execution);
+export const useActions = select((state) => state.actions);
+export const useClientManagement = select((state) => state.client);

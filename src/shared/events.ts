@@ -4,7 +4,10 @@ import {
   CacheEntry,
   GraphQLSchema,
   GraphQLError,
-  OperationType,
+  OperationRequestInfo,
+  CacheWrite,
+  ExecuteResult,
+  OperationResponseInfo,
 } from './types';
 
 export type GraphQLDevToolEventMap = {
@@ -24,24 +27,29 @@ export type GraphQLDevToolEventMap = {
     id: string;
     data: any;
     duration: number;
+    errors?: GraphQLError[];
+    request?: OperationRequestInfo;
+    response?: OperationResponseInfo;
   };
   'operation-error': {
     id: string;
+    /** Partial data sent alongside GraphQL errors */
+    data?: any;
     error: GraphQLError;
     duration: number;
+    errors?: GraphQLError[];
+    request?: OperationRequestInfo;
+    response?: OperationResponseInfo;
   };
 
   // Cache
   'cache-snapshot': {
     entries: CacheEntry[];
   };
-  'cache-update': {
-    entry: CacheEntry;
-  };
-  'cache-invalidate': {
-    keys: string[];
-  };
   'get-cache-snapshot': unknown;
+  'cache-write': {
+    write: CacheWrite;
+  };
 
   // Schema/Explorer
   'schema-loaded': {
@@ -52,10 +60,12 @@ export type GraphQLDevToolEventMap = {
   // Actions from panel to RN
   'clear-operations': unknown;
   'execute-operation': {
+    requestId: string;
     query: string;
-    variables?: Record<string, any>;
-    operationType: OperationType;
+    variables?: Record<string, unknown>;
+    headers?: Record<string, string>;
   };
+  'execute-result': ExecuteResult;
 };
 
 export type GraphQLDevToolsClient = RozeniteDevToolsClient<GraphQLDevToolEventMap>;

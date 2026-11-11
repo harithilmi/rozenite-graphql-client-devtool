@@ -1,6 +1,8 @@
 import {
   GraphQLOperation,
   CacheEntry,
+  CacheWrite,
+  ExecuteResult,
   GraphQLSchema,
 } from '../../shared/types';
 
@@ -39,11 +41,19 @@ export interface GraphQLClientAdapter {
   onOperation(callback: (operation: GraphQLOperation) => void): () => void;
 
   /**
-   * Optional: Watch for cache changes
-   * @param callback Function to call when cache changes
+   * Optional: report every write into the client cache
    * @returns Cleanup function to remove the listener
    */
-  onCacheChange?(callback: (entry: CacheEntry) => void): () => void;
+  onCacheWrite?(callback: (write: CacheWrite) => void): () => void;
+
+  /**
+   * Optional: run an operation for the Explorer tab
+   */
+  execute?(request: {
+    query: string;
+    variables?: Record<string, unknown>;
+    headers?: Record<string, string>;
+  }): Promise<Omit<ExecuteResult, 'requestId' | 'duration'>>;
 }
 
 /**
@@ -65,9 +75,5 @@ export interface AdapterConfig {
    */
   maxOperations?: number;
 
-  /**
-   * Polling interval in milliseconds for tracking operations (default: 500)
-   */
-  pollInterval?: number;
 }
 

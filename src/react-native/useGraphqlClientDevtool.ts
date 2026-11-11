@@ -123,24 +123,29 @@ export const useGraphqlClientDevtool = (config: UseGraphqlClientDevtoolConfig) =
                     id: operation.id,
                     data: operation.data,
                     duration: operation.duration || 0,
+                    request: operation.request,
+                    response: operation.response,
                 });
             } else if (operation.status === 'error') {
                 pluginClient.send('operation-error', {
                     id: operation.id,
-                    error: operation.error,
+                    data: operation.data,
+                    error: operation.error ?? { message: 'Unknown error' },
+                    errors: operation.errors,
                     duration: operation.duration || 0,
+                    request: operation.request,
+                    response: operation.response,
                 });
             }
         });
 
-        // Set up cache change tracking (if supported)
-        let unsubscribeCache: (() => void) | undefined;
-        if (adapter.onCacheChange) {
-            unsubscribeCache = adapter.onCacheChange((entry) => {
-                if (!isRecordingRef.current) return;
-                pluginClient.send('cache-update', { entry });
+        // Cache write log (if the adapter supports it)
+        const unsubscribeCache = adapter.onCacheWrite?.((write) => {
+            if (!isRecordingRef.current) return;
+            pluginClient.send('cache-write', {
+                write: includeResponseData ? write : { ...write, result: undefined },
             });
-        }
+        });
 
         return () => {
             unsubscribeOperation();
@@ -191,6 +196,15 @@ export const useGraphqlClientDevtool = (config: UseGraphqlClientDevtoolConfig) =
                 }
             }),
 
+            // Run an operation from the Explorer tab
+            pluginClient.onMessage('execute-operation', async ({ requestId, query, variables, headers }) => {
+                const startTime = Date.now();
+                const result = adapter.execute
+                    ? await adapter.execute({ query, variables, headers })
+                    : { error: 'This client adapter can not run operations.' };
+                pluginClient.send('execute-result', { requestId, duration: Date.now() - startTime, ...result });
+            }),
+
             // Handle clear operations
             pluginClient.onMessage('clear-operations', () => {
                 // Operations are managed by the panel, so nothing to do here
@@ -201,12 +215,7 @@ export const useGraphqlClientDevtool = (config: UseGraphqlClientDevtoolConfig) =
         const entries = adapter.getCacheSnapshot();
         pluginClient.send('cache-snapshot', { entries });
 
-        // Request schema
-        adapter.getSchema().then((schema) => {
-            pluginClient.send('schema-loaded', { schema });
-        }).catch((error) => {
-            console.error('[GraphQL DevTools] Failed to load schema:', error);
-        });
+        // Schema is fetched lazily: the panel sends 'get-schema' when Explorer opens
 
         return () => {
             subscriptions.forEach((subscription) => subscription.remove());

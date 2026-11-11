@@ -1,14 +1,11 @@
 export function LoadingView() {
   return (
-    <div className="flex items-center justify-center h-screen bg-gray-900 text-gray-100">
-      <div className="text-center">
-        <div className="text-4xl mb-4">⚡</div>
-        <h2 className="text-xl font-semibold mb-2">Connecting to GraphQL Client...</h2>
-        <p className="text-gray-400 text-sm">
-          Waiting for GraphQL devtool hook to initialize
-        </p>
-      </div>
+    <div className="flex h-screen flex-col items-center justify-center gap-1 bg-background text-center text-foreground">
+      <span className="h-3 w-3 animate-pulse rounded-full bg-primary" />
+      <h2 className="mt-2 font-semibold">Waiting for the app…</h2>
+      <p className="max-w-xs text-muted-foreground">
+        Open your React Native app with <code className="font-mono">useGraphqlClientDevtool</code> set up.
+      </p>
     </div>
   );
 }
-
